@@ -1,8 +1,48 @@
 {
+  "schemaVersion": 2,
   "port": 3456,
   "listenHost": "127.0.0.1",
   "upstreamBaseUrl": "https://your-upstream.example.com",
+  "apiKey": "<YOUR_ACTIVE_PROVIDER_TOKEN>",
   "requestTimeoutMs": 600000,
+  "selectedProviderId": "main",
+  "routing": {
+    "mode": "failover",
+    "cooldownMs": 30000,
+    "maxConsecutiveFailures": 2
+  },
+  "providers": [
+    {
+      "id": "main",
+      "name": "Main Provider",
+      "baseUrl": "https://your-upstream.example.com",
+      "apiKey": "<YOUR_ACTIVE_PROVIDER_TOKEN>",
+      "enabled": true,
+      "priority": 1,
+      "weight": 1,
+      "tags": [
+        "stable",
+        "primary"
+      ],
+      "priceHint": "$0.00/demo",
+      "notes": "Primary provider"
+    },
+    {
+      "id": "backup",
+      "name": "Backup Provider",
+      "baseUrl": "https://backup-upstream.example.com",
+      "apiKey": "<YOUR_BACKUP_PROVIDER_TOKEN>",
+      "enabled": true,
+      "priority": 2,
+      "weight": 1,
+      "tags": [
+        "backup",
+        "cost"
+      ],
+      "priceHint": "$0.00/demo",
+      "notes": "Fallback provider"
+    }
+  ],
   "modelMap": {
     "default": "gpt-5.1-codex",
     "opus": "gpt-5.1-codex-max",

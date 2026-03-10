@@ -1,6 +1,6 @@
 {
   "name": "claude-responses-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Local Claude-style Messages to OpenAI Responses bridge and wrapper CLI",
   "license": "MIT",
@@ -28,6 +28,7 @@
     "cli.js",
     "server.mjs",
     "bridge.mjs",
+    "config-store.mjs",
     "config.example.json",
     "README.md",
     "CHANGELOG.md"
@@ -40,11 +41,14 @@
     "access": "public"
   },
   "scripts": {
+    "console": "node cli.js",
     "start": "node cli.js serve",
     "serve": "node cli.js serve",
     "claude": "node cli.js claude",
     "doctor": "node cli.js doctor",
+    "status": "node cli.js status",
     "init": "node cli.js init",
+    "configure": "node cli.js configure",
     "pack:check": "npm pack --dry-run",
     "release:notes": "node -e \"console.log('See CHANGELOG.md for release notes.')\""
   },

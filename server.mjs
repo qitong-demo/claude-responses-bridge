@@ -1,49 +1,43 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-export const defaultConfigPath = path.join(__dirname, "config.local.json");
+import {
+  defaultModelMap,
+  defaultRouting,
+  getProviderById,
+  readBridgeConfig,
+  resolveConfigPath,
+} from "./config-store.mjs";
 
 export function parseArgs(argv) {
   const args = {};
 
-  for (let i = 0; i < argv.length; i += 1) {
-    const key = argv[i];
+  for (let index = 0; index < argv.length; index += 1) {
+    const key = argv[index];
     if (!key.startsWith("--")) {
       continue;
     }
 
     const name = key.slice(2);
-    const next = argv[i + 1];
-
+    const next = argv[index + 1];
     if (!next || next.startsWith("--")) {
       args[name] = true;
       continue;
     }
 
     args[name] = next;
-    i += 1;
+    index += 1;
   }
 
   return args;
 }
 
-export function resolveConfigPath(configArg) {
-  return path.resolve(
-    String(configArg || process.env.CLAUDE_BRIDGE_CONFIG || defaultConfigPath),
-  );
-}
-
 export function loadConfig(options = {}) {
   const configPath = resolveConfigPath(options.configPath);
-  const fileConfig = existsSync(configPath)
-    ? JSON.parse(readFileSync(configPath, "utf8"))
-    : {};
+  const fileConfig = readBridgeConfig(configPath);
+  const requestedProviderId =
+    options.provider || process.env.CLAUDE_BRIDGE_PROVIDER || fileConfig.selectedProviderId;
+  const selectedProvider =
+    getProviderById(fileConfig, requestedProviderId) || getProviderById(fileConfig);
 
   return {
     configPath,
@@ -56,10 +50,17 @@ export function loadConfig(options = {}) {
     upstreamBaseUrl: String(
       options.upstreamBaseUrl ||
         process.env.GMN_BASE_URL ||
+        selectedProvider?.baseUrl ||
         fileConfig.upstreamBaseUrl ||
         "https://gmn.chuangzuoli.com",
     ).replace(/\/+$/, ""),
-    apiKey: String(options.apiKey || process.env.GMN_API_KEY || fileConfig.apiKey || ""),
+    apiKey: String(
+      options.apiKey ||
+        process.env.GMN_API_KEY ||
+        selectedProvider?.apiKey ||
+        fileConfig.apiKey ||
+        "",
+    ),
     requestTimeoutMs: Number(
       options.requestTimeoutMs ||
         process.env.CLAUDE_BRIDGE_TIMEOUT_MS ||
@@ -71,22 +72,32 @@ export function loadConfig(options = {}) {
       (String(process.env.CLAUDE_BRIDGE_QUIET || "").toLowerCase() === "1" ||
         String(process.env.CLAUDE_BRIDGE_QUIET || "").toLowerCase() === "true"),
     modelMap: {
-      default:
-        options.modelMap?.default ||
-        fileConfig.modelMap?.default ||
-        "gpt-5.1-codex",
-      opus:
-        options.modelMap?.opus ||
-        fileConfig.modelMap?.opus ||
-        "gpt-5.1-codex-max",
-      sonnet:
-        options.modelMap?.sonnet ||
-        fileConfig.modelMap?.sonnet ||
-        "gpt-5.1-codex",
-      haiku:
-        options.modelMap?.haiku ||
-        fileConfig.modelMap?.haiku ||
-        "gpt-5.1-codex-mini",
+      default: options.modelMap?.default || fileConfig.modelMap?.default || defaultModelMap.default,
+      opus: options.modelMap?.opus || fileConfig.modelMap?.opus || defaultModelMap.opus,
+      sonnet: options.modelMap?.sonnet || fileConfig.modelMap?.sonnet || defaultModelMap.sonnet,
+      haiku: options.modelMap?.haiku || fileConfig.modelMap?.haiku || defaultModelMap.haiku,
+    },
+    selectedProviderId: selectedProvider?.id || fileConfig.selectedProviderId,
+    provider: selectedProvider || null,
+    providers: fileConfig.providers || [],
+    routing: {
+      mode:
+        options.routing?.mode ||
+        process.env.CLAUDE_BRIDGE_ROUTING_MODE ||
+        fileConfig.routing?.mode ||
+        defaultRouting.mode,
+      cooldownMs: Number(
+        options.routing?.cooldownMs ||
+          process.env.CLAUDE_BRIDGE_ROUTING_COOLDOWN_MS ||
+          fileConfig.routing?.cooldownMs ||
+          defaultRouting.cooldownMs,
+      ),
+      maxConsecutiveFailures: Number(
+        options.routing?.maxConsecutiveFailures ||
+          process.env.CLAUDE_BRIDGE_ROUTING_MAX_FAILURES ||
+          fileConfig.routing?.maxConsecutiveFailures ||
+          defaultRouting.maxConsecutiveFailures,
+      ),
     },
   };
 }
@@ -244,6 +255,20 @@ function mapToolChoice(toolChoice) {
   return undefined;
 }
 
+function createMessageTextPart(role, text) {
+  if (role === "assistant") {
+    return {
+      type: "output_text",
+      text,
+    };
+  }
+
+  return {
+    type: "input_text",
+    text,
+  };
+}
+
 function convertAnthropicToResponses(config, requestBody) {
   const input = [];
   const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
@@ -269,10 +294,7 @@ function convertAnthropicToResponses(config, requestBody) {
       }
 
       if (block.type === "text") {
-        textParts.push({
-          type: "input_text",
-          text: block.text || "",
-        });
+        textParts.push(createMessageTextPart(role, block.text || ""));
         continue;
       }
 
@@ -443,15 +465,169 @@ async function readJsonBody(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
-async function callResponsesApi(config, requestBody) {
+function createBridgeRuntime(config) {
+  return {
+    startedAt: new Date().toISOString(),
+    requestCount: 0,
+    lastRequestAt: null,
+    roundRobinIndex: 0,
+    providers: Object.fromEntries(
+      (config.providers || []).map((provider) => [
+        provider.id,
+        {
+          id: provider.id,
+          name: provider.name,
+          enabled: provider.enabled !== false,
+          baseUrl: provider.baseUrl,
+          priority: provider.priority,
+          weight: provider.weight,
+          tags: provider.tags || [],
+          notes: provider.notes || "",
+          priceHint: provider.priceHint || "",
+          totalRequests: 0,
+          successCount: 0,
+          failureCount: 0,
+          consecutiveFailures: 0,
+          averageLatencyMs: 0,
+          lastLatencyMs: null,
+          lastStatusCode: null,
+          lastError: "",
+          lastSuccessAt: null,
+          lastFailureAt: null,
+        },
+      ]),
+    ),
+  };
+}
+
+function isRetryableStatus(statusCode) {
+  return (
+    statusCode === 401 ||
+    statusCode === 403 ||
+    statusCode === 404 ||
+    statusCode === 408 ||
+    statusCode === 409 ||
+    statusCode === 429 ||
+    statusCode >= 500
+  );
+}
+
+function providerPenalty(config, providerState) {
+  if (!providerState) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  const inCooldown =
+    providerState.lastFailureAt &&
+    Date.now() - Date.parse(providerState.lastFailureAt) < config.routing.cooldownMs &&
+    providerState.consecutiveFailures >= config.routing.maxConsecutiveFailures;
+
+  return Number(providerState.priority || 1) + (inCooldown ? 1000 : 0);
+}
+
+function sortProvidersForMode(config, runtime, providers) {
+  const ordered = providers.slice().sort((left, right) => {
+    const leftState = runtime.providers[left.id];
+    const rightState = runtime.providers[right.id];
+    return providerPenalty(config, leftState) - providerPenalty(config, rightState);
+  });
+
+  if (config.routing.mode === "round-robin" && ordered.length > 1) {
+    const startIndex = runtime.roundRobinIndex % ordered.length;
+    runtime.roundRobinIndex += 1;
+    return ordered.slice(startIndex).concat(ordered.slice(0, startIndex));
+  }
+
+  if (config.routing.mode === "single") {
+    const selected = ordered.find((provider) => provider.id === config.selectedProviderId);
+    return selected ? [selected] : ordered.slice(0, 1);
+  }
+
+  return ordered;
+}
+
+function resolveCandidateProviders(config, runtime) {
+  const enabledProviders = (config.providers || []).filter((provider) => provider.enabled !== false);
+
+  if (!enabledProviders.length && config.provider) {
+    return [config.provider];
+  }
+
+  const selected = enabledProviders.find((provider) => provider.id === config.selectedProviderId);
+  const preferred = selected
+    ? [selected, ...enabledProviders.filter((provider) => provider.id !== selected.id)]
+    : enabledProviders;
+
+  return sortProvidersForMode(config, runtime, preferred);
+}
+
+function recordProviderSuccess(runtime, provider, latencyMs, statusCode) {
+  const state = runtime.providers[provider.id];
+  if (!state) {
+    return;
+  }
+
+  state.totalRequests += 1;
+  state.successCount += 1;
+  state.consecutiveFailures = 0;
+  state.lastLatencyMs = latencyMs;
+  state.lastStatusCode = statusCode;
+  state.lastError = "";
+  state.lastSuccessAt = new Date().toISOString();
+  state.averageLatencyMs = state.averageLatencyMs
+    ? Math.round((state.averageLatencyMs * (state.successCount - 1) + latencyMs) / state.successCount)
+    : latencyMs;
+}
+
+function recordProviderFailure(runtime, provider, latencyMs, error) {
+  const state = runtime.providers[provider.id];
+  if (!state) {
+    return;
+  }
+
+  state.totalRequests += 1;
+  state.failureCount += 1;
+  state.consecutiveFailures += 1;
+  state.lastLatencyMs = latencyMs;
+  state.lastStatusCode = error.statusCode || null;
+  state.lastError = error.payload?.error?.message || error.message || "unknown error";
+  state.lastFailureAt = new Date().toISOString();
+}
+
+function buildRuntimeStatus(config, runtime) {
+  const now = Date.now();
+
+  return {
+    startedAt: runtime.startedAt,
+    requestCount: runtime.requestCount,
+    lastRequestAt: runtime.lastRequestAt,
+    selectedProviderId: config.selectedProviderId,
+    routing: config.routing,
+    providers: Object.values(runtime.providers).map((provider) => {
+      const coolingDown =
+        provider.lastFailureAt &&
+        now - Date.parse(provider.lastFailureAt) < config.routing.cooldownMs &&
+        provider.consecutiveFailures >= config.routing.maxConsecutiveFailures;
+
+      return {
+        ...provider,
+        healthy: provider.enabled && !coolingDown,
+        coolingDown,
+      };
+    }),
+  };
+}
+
+async function callResponsesApi(config, runtime, provider, requestBody) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  const startedAt = Date.now();
 
   try {
-    const response = await fetch(`${config.upstreamBaseUrl}/v1/responses`, {
+    const response = await fetch(`${provider.baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${config.apiKey}`,
+        authorization: `Bearer ${provider.apiKey}`,
         "content-type": "application/json",
       },
       body: JSON.stringify(requestBody),
@@ -478,7 +654,11 @@ async function callResponsesApi(config, requestBody) {
       throw error;
     }
 
+    recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
     return data;
+  } catch (error) {
+    recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -609,6 +789,8 @@ function buildModelList(config) {
 }
 
 export function createBridgeServer(config) {
+  const runtime = createBridgeRuntime(config);
+
   return http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
 
@@ -618,8 +800,15 @@ export function createBridgeServer(config) {
         port: config.port,
         listenHost: config.listenHost,
         upstreamBaseUrl: config.upstreamBaseUrl,
+        providerId: config.selectedProviderId || null,
+        providerName: config.provider?.name || null,
+        routing: config.routing,
         modelMap: config.modelMap,
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/bridge/status") {
+      return json(res, 200, buildRuntimeStatus(config, runtime));
     }
 
     if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -658,12 +847,45 @@ export function createBridgeServer(config) {
       try {
         const body = await readJsonBody(req);
         const upstreamRequest = convertAnthropicToResponses(config, body);
-        const upstreamResponse = await callResponsesApi(config, upstreamRequest);
+        runtime.requestCount += 1;
+        runtime.lastRequestAt = new Date().toISOString();
+        const candidates = resolveCandidateProviders(config, runtime);
+        let upstreamResponse = null;
+        let usedProvider = null;
+        const errors = [];
+
+        for (const provider of candidates) {
+          try {
+            upstreamResponse = await callResponsesApi(config, runtime, provider, upstreamRequest);
+            usedProvider = provider;
+            break;
+          } catch (error) {
+            errors.push({
+              providerId: provider.id,
+              statusCode: error.statusCode || null,
+              message: error.payload?.error?.message || error.message || "unknown error",
+            });
+
+            if (!isRetryableStatus(error.statusCode || 0)) {
+              throw error;
+            }
+          }
+        }
+
+        if (!upstreamResponse || !usedProvider) {
+          const error = new Error(
+            errors[errors.length - 1]?.message || "No upstream provider completed the request.",
+          );
+          error.statusCode = errors[errors.length - 1]?.statusCode || 502;
+          error.payload = { errors };
+          throw error;
+        }
+
         const anthropicMessage = buildAnthropicMessage(body, upstreamResponse);
 
         if (!config.quiet) {
           console.log(
-            `[bridge] ${new Date().toISOString()} ${body.model || "unknown"} -> ${upstreamRequest.model}`,
+            `[bridge] ${new Date().toISOString()} ${usedProvider.id} ${body.model || "unknown"} -> ${upstreamRequest.model}`,
           );
         }
 
@@ -677,10 +899,11 @@ export function createBridgeServer(config) {
         const statusCode = error.statusCode || 502;
         const message =
           error.payload?.error?.message ||
+          error.payload?.errors?.map((item) => `${item.providerId}:${item.message}`).join(" | ") ||
           error.message ||
           "Bridge failed to call the upstream Responses API.";
         if (!config.quiet) {
-          console.error(`[bridge] error: ${message}`);
+          console.error(`[bridge] request failed: ${message}`);
         }
         return anthropicError(res, statusCode, "api_error", message);
       }
@@ -692,9 +915,7 @@ export function createBridgeServer(config) {
 
 export async function startBridgeServer(config) {
   if (!config.apiKey) {
-    throw new Error(
-      "Missing API key. Set GMN_API_KEY or create config.local.json based on config.example.json.",
-    );
+    throw new Error("Missing API token. Set GMN_API_KEY or update config.local.json.");
   }
 
   const server = createBridgeServer(config);
@@ -706,7 +927,7 @@ export async function startBridgeServer(config) {
 
   if (!config.quiet) {
     console.log(
-      `[bridge] listening on http://${config.listenHost}:${config.port} -> ${config.upstreamBaseUrl}`,
+      `[bridge] listening on http://${config.listenHost}:${config.port} -> ${config.upstreamBaseUrl} (${config.provider?.name || config.selectedProviderId || "provider"}) mode=${config.routing.mode}`,
     );
   }
 

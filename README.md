@@ -1,39 +1,230 @@
 # Claude Responses Bridge
 
-Claude Responses Bridge is a small local CLI that lets Claude-style `/v1/messages` clients talk to an upstream OpenAI-compatible `/v1/responses` server.  
-Claude Responses Bridge 是一个轻量本地 CLI，用来把 Claude 风格的 `/v1/messages` 请求桥接到上游兼容 OpenAI `/v1/responses` 的服务。
+Claude Responses Bridge is a local CLI that lets Claude-style `/v1/messages`
+clients talk to an upstream OpenAI-compatible `/v1/responses` server.
 
-## Install | 安装
+This project now ships with:
+
+- an interactive startup console
+- direct provider and token configuration inside the CLI
+- multi-provider management with create, switch, update, and delete flows
+- backward compatibility for older single-provider `config.local.json` files
+- a three-section terminal layout with Header, Status Table, and Interactive Menu
+- Chinese UI copy, ANSI colors, box borders, and keyboard navigation
+- local-first smart routing with `single`, `failover`, and `round-robin`
+- live provider telemetry from `/bridge/status`
+
+## Install
 
 ```powershell
 npm install -g claude-responses-bridge
 ```
 
-## 3 Steps | 三步完成
+## Quick Start
 
-### 1. Init | 初始化
-
-Create a local config template in the current folder.  
-在当前目录生成本地配置模板。
+Open the interactive console:
 
 ```powershell
-crb init
+crb
 ```
 
-### 2. Edit Config | 修改配置
+Or run the local file:
 
-Edit `config.local.json` and fill in your own upstream address and API key.  
-编辑 `config.local.json`，填入你自己的上游地址和 API key。
+```powershell
+node .\cli.js
+```
 
-Redacted example | 脱敏示例:
+The console shows the current bridge state and gives you guided actions for:
+
+- starting the bridge
+- launching Claude through the bridge
+- editing bridge settings
+- managing providers
+- running diagnostics
+
+The interactive console now uses:
+
+- a branded ASCII Art header
+- a status dashboard with provider and bridge state
+- an arrow-key menu instead of typing `1`, `2`, `3`
+- a short loader before high-impact actions such as starting the bridge
+
+## Direct CLI Configuration
+
+You can also configure everything without opening the console:
+
+```powershell
+crb configure --name Main --base-url https://your-upstream.example.com --api-key sk-xxxx
+```
+
+That command creates or updates the active provider and writes the config file.
+
+You can override bridge settings at the same time:
+
+```powershell
+crb configure `
+  --name Main `
+  --base-url https://your-upstream.example.com `
+  --api-key sk-xxxx `
+  --port 3456 `
+  --host 127.0.0.1 `
+  --timeout 600000 `
+  --map-default gpt-5.1-codex
+```
+
+## Provider Management
+
+List providers:
+
+```powershell
+crb provider list
+```
+
+Add a provider:
+
+```powershell
+crb provider add --name Backup --base-url https://backup.example.com --api-key sk-backup
+```
+
+Add and activate it immediately:
+
+```powershell
+crb provider add --name Backup --base-url https://backup.example.com --api-key sk-backup --activate
+```
+
+Switch the active provider:
+
+```powershell
+crb provider use backup
+```
+
+Update or replace a provider:
+
+```powershell
+crb provider update backup --base-url https://new-upstream.example.com --api-key sk-new
+```
+
+Delete a provider:
+
+```powershell
+crb provider remove backup
+```
+
+The CLI prevents deleting the last remaining provider so the bridge does not
+fall into an unusable state.
+
+## Start the Bridge
+
+Start the local bridge with the active provider:
+
+```powershell
+crb serve
+```
+
+Start it with a specific provider:
+
+```powershell
+crb serve --provider backup
+```
+
+On startup the CLI now prints a short session overview that shows the selected
+provider, upstream, token preview, and local listen address.
+
+## Launch Claude Through the Bridge
+
+```powershell
+crb claude
+```
+
+Choose a provider for one run:
+
+```powershell
+crb claude --provider backup
+```
+
+Pass Claude CLI arguments after `--`:
+
+```powershell
+crb claude --provider backup -- -p "Reply with just OK."
+```
+
+## Diagnostics
+
+Human-readable doctor output:
+
+```powershell
+crb doctor
+```
+
+JSON doctor output:
+
+```powershell
+crb doctor --json
+```
+
+The doctor report includes:
+
+- config path
+- active provider
+- upstream base URL
+- masked token state
+- Claude CLI detection
+- local listen URL
+- warnings
+
+## Smart Routing
+
+This bridge is no longer just a static relay. It now supports:
+
+- `single`: always use the selected provider
+- `failover`: use the selected provider first, then automatically retry other enabled providers
+- `round-robin`: distribute requests across enabled providers
+
+Show the current route mode:
+
+```powershell
+crb route show
+```
+
+Switch to automatic failover:
+
+```powershell
+crb route set failover
+```
+
+Inspect live provider health:
+
+```powershell
+crb status
+```
+
+Local status endpoint:
+
+```text
+GET /bridge/status
+```
+
+## Config File
+
+The config format now supports multiple providers. A simplified example:
 
 ```json
 {
+  "schemaVersion": 2,
   "port": 3456,
   "listenHost": "127.0.0.1",
   "upstreamBaseUrl": "https://your-upstream.example.com",
-  "apiKey": "<YOUR_API_KEY>",
+  "apiKey": "<YOUR_ACTIVE_PROVIDER_TOKEN>",
   "requestTimeoutMs": 600000,
+  "selectedProviderId": "main",
+  "providers": [
+    {
+      "id": "main",
+      "name": "Main Provider",
+      "baseUrl": "https://your-upstream.example.com",
+      "apiKey": "<YOUR_ACTIVE_PROVIDER_TOKEN>"
+    }
+  ],
   "modelMap": {
     "default": "gpt-5.1-codex",
     "opus": "gpt-5.1-codex-max",
@@ -43,57 +234,10 @@ Redacted example | 脱敏示例:
 }
 ```
 
-You can also use the environment variable `GMN_API_KEY` instead of writing the key into the file.  
-你也可以使用环境变量 `GMN_API_KEY`，而不是把 key 直接写进文件。
+Older configs with only `upstreamBaseUrl` and `apiKey` still work. They are
+normalized into the new provider model when the CLI loads them.
 
-### 3. Start | 启动
-
-Run a quick self-check first, then start the bridge or launch Claude through it.  
-先做一次自检，然后启动 bridge，或者直接通过它启动 Claude。
-
-```powershell
-crb doctor
-crb serve
-```
-
-Or:
-
-```powershell
-crb claude
-```
-
-One-shot example | 一次性调用示例:
-
-```powershell
-crb claude -p "Reply with just OK."
-```
-
-## Commands | 命令
-
-- `crb init`
-- `crb doctor`
-- `crb serve`
-- `crb claude [claude args...]`
-
-Equivalent local form | 等价本地写法:
-
-- `node .\cli.js init`
-- `node .\cli.js doctor`
-- `node .\cli.js serve`
-- `node .\cli.js claude [claude args...]`
-
-## What It Does | 它做了什么
-
-- Starts a local bridge on `127.0.0.1` by default.  
-  默认在 `127.0.0.1` 上启动本地 bridge。
-- Accepts Anthropic-style `/v1/messages` requests.  
-  接收 Anthropic 风格的 `/v1/messages` 请求。
-- Forwards them to an upstream `/v1/responses` API.  
-  转发到上游 `/v1/responses` API。
-- Provides a wrapper command for Claude CLI.  
-  为 Claude CLI 提供包装命令。
-
-## Endpoints | 端点
+## Endpoints
 
 - `GET /health`
 - `GET /v1/models`
@@ -101,58 +245,8 @@ Equivalent local form | 等价本地写法:
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 
-## Troubleshooting | 故障排查
+## Notes
 
-### `Cannot find module ...\\cli.js`
-
-You are likely running `node .\cli.js ...` from the wrong folder.  
-你大概率是在错误目录下执行了 `node .\cli.js ...`。
-
-Use either:
-
-```powershell
-crb doctor
-```
-
-Or run the local file from the project folder:
-
-```powershell
-Set-Location .\Claude-Responses-Bridge
-node .\cli.js doctor
-```
-
-### `hasApiKey: false`
-
-The bridge did not receive your API key.  
-这表示 bridge 没有拿到你的 API key。
-
-Fix it by either:
-
-- adding `apiKey` to `config.local.json`
-- setting `GMN_API_KEY` in the current shell
-
-### Claude still cannot connect
-
-Check these items:
-
-- `crb doctor` shows both `hasApiKey: true` and `claudeOnPath: true`
-- your upstream really supports `POST /v1/responses`
-- your API key is valid for that upstream
-- your chosen port is not already in use
-
-## Privacy | 隐私
-
-- This README intentionally uses redacted examples only.  
-  本 README 只使用脱敏示例。
-- No local username, private domain, or real API key is shown here.  
-  这里不会展示本机用户名、私有域名或真实 API key。
-- If you share logs or screenshots, redact file paths, domains, and tokens first.  
-  如果你需要分享日志或截图，请先遮住路径、域名和密钥。
-
-## Open Source Release | 开源发布
-
-- Repository: `https://github.com/qitong-demo/claude-responses-bridge`
-- Homepage: `https://github.com/qitong-demo/claude-responses-bridge#readme`
-- Issues: `https://github.com/qitong-demo/claude-responses-bridge/issues`
-- Release notes: see `CHANGELOG.md`
-- Recommended first git tag: `v0.1.0`
+- `config.local.json` remains ignored by git.
+- Keep real domains and tokens out of screenshots and logs.
+- Use `config.example.json` as a safe public example.

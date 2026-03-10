@@ -1,2 +1,4 @@
 config.local.json
 *.tgz
+bridge.stdout.log
+bridge.stderr.log

@@ -1,10 +1,30 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.  
-本项目的重要变更会记录在这里。
+All notable changes to this project will be documented in this file.
+The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-The format is based on Keep a Changelog, and this project follows Semantic Versioning.  
-格式参考 Keep a Changelog，版本遵循 Semantic Versioning。
+## [0.2.0] - 2026-03-10
+
+### Added
+
+- Interactive CLI console as the default startup experience
+- Multi-provider config model with active provider selection
+- `configure`, `provider list`, `provider add`, `provider update`, `provider use`, and `provider remove` commands
+- Guided provider setup when `serve` or `claude` is missing a token
+- Richer `doctor` output with provider context and warnings
+- Provider details in the local `/health` endpoint
+- Three-section terminal layout with Header, Status Table, and Interactive Menu
+- ANSI-colored Chinese console UI with arrow-key navigation and action loader feedback
+- Local-first smart routing with `single`, `failover`, and `round-robin`
+- `/bridge/status` telemetry endpoint for provider health and recent request stats
+
+### Changed
+
+- `config.example.json` now documents the multi-provider schema
+- Existing single-provider configs remain backward compatible and are normalized on load
+- README now focuses on CLI-first setup and provider workflows
+- Bridge startup logs include the selected provider identity
+- Provider metadata now supports enablement, priority, weight, tags, notes, and price hints
 
 ## [0.1.0] - 2026-03-10
 
