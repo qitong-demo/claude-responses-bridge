@@ -151,8 +151,8 @@ Check these items:
 
 ## Open Source Release | 开源发布
 
-- Repository: `https://github.com/qito/claude-responses-bridge`
-- Homepage: `https://github.com/qito/claude-responses-bridge#readme`
-- Issues: `https://github.com/qito/claude-responses-bridge/issues`
+- Repository: `https://github.com/qitong-demo/claude-responses-bridge`
+- Homepage: `https://github.com/qitong-demo/claude-responses-bridge#readme`
+- Issues: `https://github.com/qitong-demo/claude-responses-bridge/issues`
 - Release notes: see `CHANGELOG.md`
 - Recommended first git tag: `v0.1.0`

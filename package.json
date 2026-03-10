@@ -4,14 +4,14 @@
   "type": "module",
   "description": "Local Claude-style Messages to OpenAI Responses bridge and wrapper CLI",
   "license": "MIT",
-  "author": "qito",
-  "homepage": "https://github.com/qito/claude-responses-bridge#readme",
+  "author": "qitong-demo",
+  "homepage": "https://github.com/qitong-demo/claude-responses-bridge#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/qito/claude-responses-bridge.git"
+    "url": "git+https://github.com/qitong-demo/claude-responses-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/qito/claude-responses-bridge/issues"
+    "url": "https://github.com/qitong-demo/claude-responses-bridge/issues"
   },
   "keywords": [
     "claude",
