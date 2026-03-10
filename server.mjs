@@ -1,6 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import {
+  defaultProviderBaseUrl,
   defaultModelMap,
   defaultRouting,
   getProviderById,
@@ -52,7 +53,7 @@ export function loadConfig(options = {}) {
         process.env.GMN_BASE_URL ||
         selectedProvider?.baseUrl ||
         fileConfig.upstreamBaseUrl ||
-        "https://gmn.chuangzuoli.com",
+        defaultProviderBaseUrl,
     ).replace(/\/+$/, ""),
     apiKey: String(
       options.apiKey ||

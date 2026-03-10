@@ -6,7 +6,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const defaultConfigPath = path.join(__dirname, "config.local.json");
-export const defaultProviderBaseUrl = "https://gmn.chuangzuoli.com";
+export const defaultProviderBaseUrl = "https://api.example.com";
 export const defaultModelMap = {
   default: "gpt-5.1-codex",
   opus: "gpt-5.1-codex-max",

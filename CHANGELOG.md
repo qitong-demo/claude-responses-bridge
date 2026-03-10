@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.2.1] - 2026-03-10
+
+### Changed
+
+- Replaced hard-coded default upstream domain with a neutral example domain
+- Replaced package author and repository metadata with neutral placeholders
+- Removed remaining public identity hints from the distributed source
+
 ## [0.2.0] - 2026-03-10
 
 ### Added
