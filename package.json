@@ -1,0 +1,54 @@
+{
+  "name": "claude-responses-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local Claude-style Messages to OpenAI Responses bridge and wrapper CLI",
+  "license": "MIT",
+  "author": "qito",
+  "homepage": "https://github.com/qito/claude-responses-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qito/claude-responses-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qito/claude-responses-bridge/issues"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "openai",
+    "responses",
+    "proxy",
+    "bridge",
+    "cli",
+    "messages",
+    "wrapper"
+  ],
+  "files": [
+    "cli.js",
+    "server.mjs",
+    "bridge.mjs",
+    "config.example.json",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "bin": {
+    "claude-responses-bridge": "cli.js",
+    "crb": "cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node cli.js serve",
+    "serve": "node cli.js serve",
+    "claude": "node cli.js claude",
+    "doctor": "node cli.js doctor",
+    "init": "node cli.js init",
+    "pack:check": "npm pack --dry-run",
+    "release:notes": "node -e \"console.log('See CHANGELOG.md for release notes.')\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
