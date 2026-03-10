@@ -1,31 +1,31 @@
 # Claude Responses Bridge
 
 Claude Responses Bridge is a small local CLI that lets Claude-style `/v1/messages` clients talk to an upstream OpenAI-compatible `/v1/responses` server.  
-Claude Responses Bridge 是一个轻量本地 CLI，用来把 Claude 风格的 `/v1/messages` 请求桥接到上游兼容 OpenAI `/v1/responses` 的服务。
+Claude Responses Bridge ??????? CLI,??? Claude ??? `/v1/messages` ????????? OpenAI `/v1/responses` ????
 
-## Install | 安装
+## Install | ??
 
 ```powershell
 npm install -g claude-responses-bridge
 ```
 
-## 3 Steps | 三步完成
+## 3 Steps | ????
 
-### 1. Init | 初始化
+### 1. Init | ???
 
 Create a local config template in the current folder.  
-在当前目录生成本地配置模板。
+??????????????
 
 ```powershell
 crb init
 ```
 
-### 2. Edit Config | 修改配置
+### 2. Edit Config | ????
 
 Edit `config.local.json` and fill in your own upstream address and API key.  
-编辑 `config.local.json`，填入你自己的上游地址和 API key。
+?? `config.local.json`,??????????? API key?
 
-Redacted example | 脱敏示例:
+Redacted example | ????:
 
 ```json
 {
@@ -44,12 +44,12 @@ Redacted example | 脱敏示例:
 ```
 
 You can also use the environment variable `GMN_API_KEY` instead of writing the key into the file.  
-你也可以使用环境变量 `GMN_API_KEY`，而不是把 key 直接写进文件。
+?????????? `GMN_API_KEY`,???? key ???????
 
-### 3. Start | 启动
+### 3. Start | ??
 
 Run a quick self-check first, then start the bridge or launch Claude through it.  
-先做一次自检，然后启动 bridge，或者直接通过它启动 Claude。
+??????,???? bridge,????????? Claude?
 
 ```powershell
 crb doctor
@@ -62,38 +62,38 @@ Or:
 crb claude
 ```
 
-One-shot example | 一次性调用示例:
+One-shot example | ???????:
 
 ```powershell
 crb claude -p "Reply with just OK."
 ```
 
-## Commands | 命令
+## Commands | ??
 
 - `crb init`
 - `crb doctor`
 - `crb serve`
 - `crb claude [claude args...]`
 
-Equivalent local form | 等价本地写法:
+Equivalent local form | ??????:
 
 - `node .\cli.js init`
 - `node .\cli.js doctor`
 - `node .\cli.js serve`
 - `node .\cli.js claude [claude args...]`
 
-## What It Does | 它做了什么
+## What It Does | ?????
 
 - Starts a local bridge on `127.0.0.1` by default.  
-  默认在 `127.0.0.1` 上启动本地 bridge。
+  ??? `127.0.0.1` ????? bridge?
 - Accepts Anthropic-style `/v1/messages` requests.  
-  接收 Anthropic 风格的 `/v1/messages` 请求。
+  ?? Anthropic ??? `/v1/messages` ???
 - Forwards them to an upstream `/v1/responses` API.  
-  转发到上游 `/v1/responses` API。
+  ????? `/v1/responses` API?
 - Provides a wrapper command for Claude CLI.  
-  为 Claude CLI 提供包装命令。
+  ? Claude CLI ???????
 
-## Endpoints | 端点
+## Endpoints | ??
 
 - `GET /health`
 - `GET /v1/models`
@@ -101,12 +101,12 @@ Equivalent local form | 等价本地写法:
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 
-## Troubleshooting | 故障排查
+## Troubleshooting | ????
 
 ### `Cannot find module ...\\cli.js`
 
 You are likely running `node .\cli.js ...` from the wrong folder.  
-你大概率是在错误目录下执行了 `node .\cli.js ...`。
+?????????????? `node .\cli.js ...`?
 
 Use either:
 
@@ -124,7 +124,7 @@ node .\cli.js doctor
 ### `hasApiKey: false`
 
 The bridge did not receive your API key.  
-这表示 bridge 没有拿到你的 API key。
+??? bridge ?????? API key?
 
 Fix it by either:
 
@@ -140,16 +140,16 @@ Check these items:
 - your API key is valid for that upstream
 - your chosen port is not already in use
 
-## Privacy | 隐私
+## Privacy | ??
 
 - This README intentionally uses redacted examples only.  
-  本 README 只使用脱敏示例。
+  ? README ????????
 - No local username, private domain, or real API key is shown here.  
-  这里不会展示本机用户名、私有域名或真实 API key。
+  ??????????????????? API key?
 - If you share logs or screenshots, redact file paths, domains, and tokens first.  
-  如果你需要分享日志或截图，请先遮住路径、域名和密钥。
+  ????????????,?????????????
 
-## Open Source Release | 开源发布
+## Open Source Release | ????
 
 - Repository: `https://github.com/qitong-demo/claude-responses-bridge`
 - Homepage: `https://github.com/qitong-demo/claude-responses-bridge#readme`

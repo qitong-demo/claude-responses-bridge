@@ -1,0 +1,12 @@
+{
+  "port": 3456,
+  "listenHost": "127.0.0.1",
+  "upstreamBaseUrl": "https://your-upstream.example.com",
+  "requestTimeoutMs": 600000,
+  "modelMap": {
+    "default": "gpt-5.1-codex",
+    "opus": "gpt-5.1-codex-max",
+    "sonnet": "gpt-5.1-codex",
+    "haiku": "gpt-5.1-codex-mini"
+  }
+}
