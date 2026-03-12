@@ -523,6 +523,9 @@ function createBridgeRuntime(config) {
           tags: provider.tags || [],
           notes: provider.notes || "",
           priceHint: provider.priceHint || "",
+          inFlightCount: 0,
+          queuedCount: 0,
+          pending: Promise.resolve(),
           totalRequests: 0,
           successCount: 0,
           failureCount: 0,
@@ -650,11 +653,40 @@ function buildRuntimeStatus(config, runtime) {
 
       return {
         ...provider,
+        pending: undefined,
         healthy: provider.enabled && !coolingDown,
         coolingDown,
       };
     }),
   };
+}
+
+async function runWithProviderQueue(runtime, provider, task) {
+  const state = runtime.providers[provider.id];
+  if (!state) {
+    return task();
+  }
+
+  state.queuedCount += 1;
+
+  const execute = async () => {
+    state.queuedCount = Math.max(0, state.queuedCount - 1);
+    state.inFlightCount += 1;
+    try {
+      return await task();
+    } finally {
+      state.inFlightCount = Math.max(0, state.inFlightCount - 1);
+    }
+  };
+
+  const previous = state.pending || Promise.resolve();
+  const current = previous.catch(() => {}).then(execute);
+  state.pending = current.finally(() => {
+    if (state.pending === current) {
+      state.pending = Promise.resolve();
+    }
+  });
+  return current;
 }
 
 function buildProviderError(provider, error) {
@@ -680,42 +712,44 @@ async function callUpstreamJson(config, runtime, provider, options) {
     body,
     headers = {},
   } = options;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
-  const startedAt = Date.now();
+  return runWithProviderQueue(runtime, provider, async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+    const startedAt = Date.now();
 
-  try {
-    const response = await fetch(`${provider.baseUrl}${pathname}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${provider.apiKey}`,
-        ...(body !== undefined ? { "content-type": "application/json" } : {}),
-        ...headers,
-      },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      signal: controller.signal,
-    });
+    try {
+      const response = await fetch(`${provider.baseUrl}${pathname}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${provider.apiKey}`,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+          ...headers,
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        signal: controller.signal,
+      });
 
-    const rawText = await response.text();
-    const data = parseJsonText(rawText);
+      const rawText = await response.text();
+      const data = parseJsonText(rawText);
 
-    if (!response.ok) {
-      const error = new Error(
-        data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
-      );
-      error.statusCode = response.status;
-      error.payload = data;
+      if (!response.ok) {
+        const error = new Error(
+          data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
+        );
+        error.statusCode = response.status;
+        error.payload = data;
+        throw error;
+      }
+
+      recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
+      return data;
+    } catch (error) {
+      recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
       throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
-    return data;
-  } catch (error) {
-    recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+  });
 }
 
 async function callResponsesApi(config, runtime, provider, requestBody) {
@@ -895,58 +929,65 @@ async function streamResponsesEvents(config, runtime, requestBody, handlers) {
   const errors = [];
 
   for (const provider of candidates) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
-    const startedAt = Date.now();
-    let sawEvent = false;
-
     try {
-      const response = await fetch(`${provider.baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${provider.apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          ...requestBody,
-          stream: true,
-        }),
-        signal: controller.signal,
-      });
+      await runWithProviderQueue(runtime, provider, async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+        const startedAt = Date.now();
+        let sawEvent = false;
 
-      if (!response.ok) {
-        const rawText = await response.text();
-        const data = parseJsonText(rawText);
-        const error = new Error(
-          data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
-        );
-        error.statusCode = response.status;
-        error.payload = data;
-        throw error;
-      }
+        try {
+          const response = await fetch(`${provider.baseUrl}/v1/responses`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${provider.apiKey}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              ...requestBody,
+              stream: true,
+            }),
+            signal: controller.signal,
+          });
 
-      for await (const event of iterateSseJsonEvents(response.body)) {
-        sawEvent = true;
+          if (!response.ok) {
+            const rawText = await response.text();
+            const data = parseJsonText(rawText);
+            const error = new Error(
+              data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
+            );
+            error.statusCode = response.status;
+            error.payload = data;
+            throw error;
+          }
 
-        if (event?.type === "error" && event?.error) {
-          throw createResponsesStreamError(event);
+          for await (const event of iterateSseJsonEvents(response.body)) {
+            sawEvent = true;
+
+            if (event?.type === "error" && event?.error) {
+              throw createResponsesStreamError(event);
+            }
+
+            await handlers.onEvent?.(event, provider);
+          }
+
+          recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
+          await handlers.onComplete?.(provider);
+        } catch (error) {
+          recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
+          error.__bridgeSawEvent = sawEvent;
+          throw error;
+        } finally {
+          clearTimeout(timeout);
         }
-
-        await handlers.onEvent?.(event, provider);
-      }
-
-      recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
-      await handlers.onComplete?.(provider);
+      });
       return provider;
     } catch (error) {
-      recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
       errors.push(buildProviderError(provider, error));
 
-      if (sawEvent || !isRetryableStatus(error.statusCode || 0)) {
+      if (error.__bridgeSawEvent || !isRetryableStatus(error.statusCode || 0)) {
         throw error;
       }
-    } finally {
-      clearTimeout(timeout);
     }
   }
 

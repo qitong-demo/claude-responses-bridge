@@ -18,6 +18,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Cursor extension detection on Windows now invokes `cursor.cmd` through PowerShell, so installed extensions like Continue are detected reliably
 - Cursor integration no longer flips between installed and not-installed states depending on how the CLI resolves the Cursor command
 
+## [0.3.3] - 2026-03-12
+
+### Fixed
+
+- Bridge now serializes upstream requests per provider to reduce `Concurrency limit exceeded for account` errors from low-concurrency upstream gateways
+- Provider status output now exposes queue and in-flight counts for easier troubleshooting
+
 ## [0.3.0] - 2026-03-12
 
 ### Added
