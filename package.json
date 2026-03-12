@@ -1,17 +1,17 @@
 {
   "name": "claude-responses-bridge",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "Local Claude-style Messages to OpenAI Responses bridge and wrapper CLI",
   "license": "MIT",
   "author": "",
-  "homepage": "https://github.com/your-org/claude-responses-bridge#readme",
+  "homepage": "https://github.com/qitong-demo/claude-responses-bridge#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-org/claude-responses-bridge.git"
+    "url": "git+https://github.com/qitong-demo/claude-responses-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/your-org/claude-responses-bridge/issues"
+    "url": "https://github.com/qitong-demo/claude-responses-bridge/issues"
   },
   "keywords": [
     "claude",
@@ -25,9 +25,11 @@
     "wrapper"
   ],
   "files": [
+    "cli",
     "cli.js",
     "server.mjs",
     "bridge.mjs",
+    "openai-compat.mjs",
     "config-store.mjs",
     "config.example.json",
     "README.md",
@@ -45,7 +47,9 @@
     "start": "node cli.js serve",
     "serve": "node cli.js serve",
     "claude": "node cli.js claude",
+    "cursor": "node cli.js cursor",
     "doctor": "node cli.js doctor",
+    "ide": "node cli.js ide",
     "status": "node cli.js status",
     "init": "node cli.js init",
     "configure": "node cli.js configure",

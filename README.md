@@ -8,6 +8,9 @@ This project now ships with:
 - an interactive startup console
 - direct provider and token configuration inside the CLI
 - multi-provider management with create, switch, update, and delete flows
+- a local OpenAI-compatible `/v1/chat/completions` bridge for Cursor and Cline
+- a local OpenAI-compatible `/v1/responses` passthrough for tools that already use Responses API
+- a Cursor integration command that can detect Cursor, install Continue, and write a bridge-backed Continue config
 - backward compatibility for older single-provider `config.local.json` files
 - a three-section terminal layout with Header, Status Table, and Interactive Menu
 - Chinese UI copy, ANSI colors, box borders, and keyboard navigation
@@ -71,6 +74,37 @@ crb configure `
   --timeout 600000 `
   --map-default gpt-5.1-codex
 ```
+
+## Cursor Plugin Setup
+
+If Cursor Free blocks the native BYOK model picker, use the bridge through an
+official third-party extension instead of trying to unlock Cursor's built-in
+named models.
+
+Guided Cursor integration:
+
+```powershell
+crb cursor
+```
+
+Non-interactive install + config write:
+
+```powershell
+crb cursor --install --write-config
+```
+
+This flow:
+
+- detects the local Cursor command path
+- checks whether the official `Continue` extension is installed
+- optionally installs `Continue` into Cursor
+- optionally writes `~/.continue/config.yaml` so Continue uses the local bridge
+
+This flow does not:
+
+- unlock Cursor's built-in named model picker
+- remove Cursor's native free-plan restriction
+- modify your upstream provider key inside Cursor's native account system
 
 ## Provider Management
 
@@ -172,6 +206,62 @@ The doctor report includes:
 - local listen URL
 - warnings
 
+## Cursor and VSCode / Cline
+
+Start the bridge:
+
+```powershell
+node .\cli.js serve
+```
+
+Print IDE-ready local settings:
+
+```powershell
+node .\cli.js ide
+node .\cli.js ide --json
+```
+
+Or use the guided Cursor integration flow:
+
+```powershell
+node .\cli.js cursor
+```
+
+The bridge now exposes an OpenAI-compatible local endpoint:
+
+```text
+http://127.0.0.1:3456/v1
+```
+
+Use this local endpoint inside Cursor or Cline instead of your upstream proxy:
+
+- Base URL: `http://127.0.0.1:3456/v1`
+- API Key: `bridge-local`
+- Recommended model: `gpt-5.2-codex`
+
+### Cursor
+
+In `Settings -> Models -> API Keys`:
+
+- enable `OpenAI API Key`
+- set the key to `bridge-local`
+- enable `Override OpenAI Base URL`
+- set the base URL to `http://127.0.0.1:3456/v1`
+- choose `gpt-5.2-codex`
+
+If your Cursor plan blocks native BYOK flows, install Cline inside Cursor and use
+the Cline setup below, or run `crb cursor` to set up Continue automatically.
+
+### VSCode / Cursor + Cline
+
+In Cline settings:
+
+- `API Provider`: `OpenAI Compatible`
+- `Base URL`: `http://127.0.0.1:3456/v1`
+- `API Key`: `bridge-local`
+- `Model ID`: `gpt-5.2-codex`
+- `Native Tool Call`: optional, but supported by the bridge
+
 ## Smart Routing
 
 This bridge is no longer just a static relay. It now supports:
@@ -240,8 +330,13 @@ normalized into the new provider model when the CLI loads them.
 ## Endpoints
 
 - `GET /health`
+- `GET /models`
 - `GET /v1/models`
 - `GET /v1/models/:id`
+- `POST /chat/completions`
+- `POST /v1/chat/completions`
+- `POST /responses`
+- `POST /v1/responses`
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 

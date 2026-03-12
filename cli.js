@@ -23,6 +23,8 @@ import {
   parseArgs,
   startBridgeServer,
 } from "./server.mjs";
+import { runCursor } from "./cli/cursor.mjs";
+import { runIde } from "./cli/ide.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -235,6 +237,7 @@ function printHelp() {
     "  node cli.js claude [--config PATH] [--provider ID] [-- 本地参数 ] -- [claude 参数]",
     "  node cli.js doctor [--config PATH] [--provider ID] [--json]",
     "  node cli.js status [--host HOST] [--port N]",
+    "  node cli.js cursor [--config PATH] [--install] [--write-config] [--force] [--json]",
     "",
     "示例：",
     "  node cli.js",
@@ -243,6 +246,7 @@ function printHelp() {
     "  node cli.js provider use backup",
     "  node cli.js route set failover",
     "  node cli.js serve --provider backup",
+    "  node cli.js cursor --install --write-config",
     "  node cli.js claude --provider default -- -p \"只回复 OK\"",
   ];
 
@@ -1439,6 +1443,7 @@ async function runConsole(restArgs) {
         [
           { label: "快速启动 Bridge", description: "按当前配置启动本地桥接服务", value: "serve" },
           { label: "启动 Claude", description: "通过当前运营商直接拉起 Claude CLI", value: "claude" },
+          { label: "Cursor 集成", description: "检测 Cursor 并可选安装 Continue 插件与桥接配置", value: "cursor" },
           { label: "管理运营商", description: "新建、切换、编辑、删除运营商", value: "providers" },
           { label: "智能路由", description: "查看或切换 single / failover / round-robin", value: "route" },
           { label: "实时状态", description: "查看本地桥的线路健康度和请求统计", value: "status" },
@@ -1470,6 +1475,13 @@ async function runConsole(restArgs) {
         rl.close();
         clearScreen();
         return runClaude(["--config", configPath, "--"]);
+      }
+
+      if (action === "cursor") {
+        await showLoader("正在检测 Cursor 与插件集成状态 ...", 700);
+        rl.close();
+        clearScreen();
+        return runCursor(["--config", configPath]);
       }
 
       if (action === "providers") {
@@ -1559,10 +1571,14 @@ async function main() {
       return runClaude(rest);
     case "doctor":
       return runDoctor(rest);
+    case "cursor":
+      return runCursor(rest);
+    case "ide":
+      return runIde(rest);
     default:
       return runConsole(process.argv.slice(2));
   }
 }
 
 const code = await main();
-process.exit(code);
+process.exitCode = code;

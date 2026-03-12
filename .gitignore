@@ -1,4 +1,5 @@
 config.local.json
+.npmrc
 *.tgz
 bridge.stdout.log
 bridge.stderr.log

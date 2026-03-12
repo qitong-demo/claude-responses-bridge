@@ -3,6 +3,24 @@
 All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.3.0] - 2026-03-12
+
+### Added
+
+- Local OpenAI-compatible `/v1/chat/completions` bridge that converts Cursor/Cline requests into upstream `/v1/responses`
+- Local OpenAI-compatible `/v1/responses` passthrough with provider failover support
+- `ide` CLI command that prints Cursor and VSCode/Cline setup values
+- `cursor` CLI command that detects Cursor, can install Continue, and can write bridge-backed Continue config
+- `/models` and `/chat/completions` aliases so clients can use base URLs with or without `/v1`
+
+### Changed
+
+- `/health` now includes IDE-friendly local bridge settings
+- `/v1/models` now returns upstream model ids plus Claude alias entries
+- CLI shutdown now uses `process.exitCode` to avoid Windows assertion failures after network requests
+- Streaming chat and messages routes now forward upstream Responses SSE in real time instead of waiting for a full response first
+- `.npmrc` is now ignored so local npm tokens do not get committed accidentally
+
 ## [0.2.1] - 2026-03-10
 
 ### Changed

@@ -8,6 +8,14 @@ import {
   readBridgeConfig,
   resolveConfigPath,
 } from "./config-store.mjs";
+import {
+  buildOpenAiChatCompletion,
+  buildUnifiedModelList,
+  convertOpenAiChatToResponses,
+  mapOpenAiModel,
+  pickRecommendedModel,
+  streamOpenAiChatCompletion,
+} from "./openai-compat.mjs";
 
 export function parseArgs(argv) {
   const args = {};
@@ -121,6 +129,16 @@ function anthropicError(res, statusCode, type, message) {
   });
 }
 
+function openAiError(res, statusCode, type, message, details = undefined) {
+  json(res, statusCode, {
+    error: {
+      message,
+      type,
+      ...(details && typeof details === "object" ? details : {}),
+    },
+  });
+}
+
 function sseHeaders(res) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -132,6 +150,26 @@ function sseHeaders(res) {
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function writeOpenAiSseChunk(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function pathMatches(pathname, candidates) {
+  return candidates.includes(pathname);
+}
+
+function parseJsonText(rawText) {
+  if (!rawText) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return { raw: rawText };
+  }
 }
 
 function estimateTokens(value) {
@@ -619,32 +657,47 @@ function buildRuntimeStatus(config, runtime) {
   };
 }
 
-async function callResponsesApi(config, runtime, provider, requestBody) {
+function buildProviderError(provider, error) {
+  return {
+    providerId: provider.id,
+    statusCode: error.statusCode || null,
+    message: error.payload?.error?.message || error.payload?.message || error.message || "unknown error",
+  };
+}
+
+function aggregateProviderError(errors, fallbackMessage) {
+  const lastError = errors[errors.length - 1];
+  const error = new Error(lastError?.message || fallbackMessage);
+  error.statusCode = lastError?.statusCode || 502;
+  error.payload = { errors };
+  return error;
+}
+
+async function callUpstreamJson(config, runtime, provider, options) {
+  const {
+    pathname,
+    method = "GET",
+    body,
+    headers = {},
+  } = options;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   const startedAt = Date.now();
 
   try {
-    const response = await fetch(`${provider.baseUrl}/v1/responses`, {
-      method: "POST",
+    const response = await fetch(`${provider.baseUrl}${pathname}`, {
+      method,
       headers: {
         authorization: `Bearer ${provider.apiKey}`,
-        "content-type": "application/json",
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        ...headers,
       },
-      body: JSON.stringify(requestBody),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: controller.signal,
     });
 
     const rawText = await response.text();
-    let data = {};
-
-    if (rawText) {
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        data = { raw: rawText };
-      }
-    }
+    const data = parseJsonText(rawText);
 
     if (!response.ok) {
       const error = new Error(
@@ -663,6 +716,856 @@ async function callResponsesApi(config, runtime, provider, requestBody) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function callResponsesApi(config, runtime, provider, requestBody) {
+  return callUpstreamJson(config, runtime, provider, {
+    pathname: "/v1/responses",
+    method: "POST",
+    body: requestBody,
+  });
+}
+
+async function requestAcrossProviders(config, runtime, options) {
+  const candidates = resolveCandidateProviders(config, runtime);
+  const errors = [];
+
+  for (const provider of candidates) {
+    try {
+      const data = await callUpstreamJson(config, runtime, provider, options);
+      return {
+        data,
+        provider,
+      };
+    } catch (error) {
+      errors.push(buildProviderError(provider, error));
+      if (!isRetryableStatus(error.statusCode || 0)) {
+        throw error;
+      }
+    }
+  }
+
+  throw aggregateProviderError(
+    errors,
+    "No upstream provider completed the request.",
+  );
+}
+
+async function pipeWebStreamToResponse(stream, res) {
+  const reader = stream.getReader();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    res.write(Buffer.from(value));
+  }
+}
+
+async function* iterateSseJsonEvents(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const flushRecord = (record) => {
+    const dataLines = record
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .filter(Boolean);
+
+    if (!dataLines.length) {
+      return null;
+    }
+
+    const payload = dataLines.join("\n");
+    if (payload === "[DONE]") {
+      return { done: true };
+    }
+
+    return {
+      done: false,
+      value: parseJsonText(payload),
+    };
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    let boundaryIndex = buffer.indexOf("\n\n");
+    while (boundaryIndex !== -1) {
+      const record = buffer.slice(0, boundaryIndex);
+      buffer = buffer.slice(boundaryIndex + 2);
+      const parsed = flushRecord(record);
+      if (parsed?.done) {
+        return;
+      }
+      if (parsed?.value) {
+        yield parsed.value;
+      }
+      boundaryIndex = buffer.indexOf("\n\n");
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  const parsed = flushRecord(buffer.trim());
+  if (parsed?.value) {
+    yield parsed.value;
+  }
+}
+
+function createResponsesStreamError(event) {
+  const error = new Error(
+    event?.error?.message ||
+      event?.message ||
+      "Upstream Responses stream failed.",
+  );
+  error.statusCode = 502;
+  error.payload = event;
+  return error;
+}
+
+function responseUsageFromEvent(event) {
+  return event?.response?.usage || event?.usage || null;
+}
+
+function responseStatusFromEvent(event) {
+  return event?.response?.status || event?.status || null;
+}
+
+function responseIncompleteDetailsFromEvent(event) {
+  return event?.response?.incomplete_details || event?.incomplete_details || null;
+}
+
+function responseIdentityFromEvent(event, fallback = {}) {
+  return {
+    id:
+      event?.response?.id ||
+      event?.response_id ||
+      fallback.id ||
+      `resp_${crypto.randomUUID()}`,
+    model:
+      event?.response?.model ||
+      event?.model ||
+      fallback.model ||
+      "unknown",
+    created:
+      Number.isFinite(event?.response?.created_at)
+        ? Math.floor(event.response.created_at)
+        : fallback.created || Math.floor(Date.now() / 1000),
+  };
+}
+
+function determineChatFinishReason(state, event) {
+  if (state.sawToolCalls) {
+    return "tool_calls";
+  }
+
+  const status = responseStatusFromEvent(event);
+  const incomplete = responseIncompleteDetailsFromEvent(event);
+  if (status === "incomplete" && incomplete?.reason === "max_output_tokens") {
+    return "length";
+  }
+
+  return "stop";
+}
+
+function determineAnthropicStopReason(state, event) {
+  if (state.sawToolUse) {
+    return "tool_use";
+  }
+
+  const status = responseStatusFromEvent(event);
+  const incomplete = responseIncompleteDetailsFromEvent(event);
+  if (status === "incomplete" && incomplete?.reason === "max_output_tokens") {
+    return "max_tokens";
+  }
+
+  return "end_turn";
+}
+
+async function streamResponsesEvents(config, runtime, requestBody, handlers) {
+  const candidates = resolveCandidateProviders(config, runtime);
+  const errors = [];
+
+  for (const provider of candidates) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+    const startedAt = Date.now();
+    let sawEvent = false;
+
+    try {
+      const response = await fetch(`${provider.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${provider.apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const rawText = await response.text();
+        const data = parseJsonText(rawText);
+        const error = new Error(
+          data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
+        );
+        error.statusCode = response.status;
+        error.payload = data;
+        throw error;
+      }
+
+      for await (const event of iterateSseJsonEvents(response.body)) {
+        sawEvent = true;
+
+        if (event?.type === "error" && event?.error) {
+          throw createResponsesStreamError(event);
+        }
+
+        await handlers.onEvent?.(event, provider);
+      }
+
+      recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
+      await handlers.onComplete?.(provider);
+      return provider;
+    } catch (error) {
+      recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
+      errors.push(buildProviderError(provider, error));
+
+      if (sawEvent || !isRetryableStatus(error.statusCode || 0)) {
+        throw error;
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw aggregateProviderError(
+    errors,
+    "No upstream provider completed the streaming request.",
+  );
+}
+
+function createOpenAiChatStreamWriter(res, requestBody, mappedModel) {
+  const state = {
+    started: false,
+    completed: false,
+    sawToolCalls: false,
+    emittedText: false,
+    emittedRole: false,
+    chunkId: `chatcmpl_${crypto.randomUUID()}`,
+    created: Math.floor(Date.now() / 1000),
+    model: mappedModel,
+    usage: null,
+    includeUsage: Boolean(requestBody.stream_options?.include_usage),
+    tools: new Map(),
+    nextToolIndex: 0,
+  };
+
+  const baseChunk = () => ({
+    id: state.chunkId,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+  });
+
+  const ensureStarted = () => {
+    if (state.started) {
+      return;
+    }
+    state.started = true;
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    });
+  };
+
+  const emit = (payload) => {
+    ensureStarted();
+    writeOpenAiSseChunk(res, payload);
+  };
+
+  const emitRole = () => {
+    if (state.emittedRole) {
+      return;
+    }
+    state.emittedRole = true;
+    emit({
+      ...baseChunk(),
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+          },
+          finish_reason: null,
+        },
+      ],
+    });
+  };
+
+  const ensureToolState = (itemId, meta = {}) => {
+    const key = itemId || meta.id || meta.callId || crypto.randomUUID();
+    if (!state.tools.has(key)) {
+      state.tools.set(key, {
+        key,
+        index: state.nextToolIndex,
+        id: meta.id || meta.callId || key,
+        name: meta.name || meta.functionName || "tool",
+        headerSent: false,
+        argumentDeltaSent: false,
+      });
+      state.nextToolIndex += 1;
+    }
+
+    const toolState = state.tools.get(key);
+    if (meta.id || meta.callId) {
+      toolState.id = meta.id || meta.callId;
+    }
+    if (meta.name || meta.functionName) {
+      toolState.name = meta.name || meta.functionName;
+    }
+    return toolState;
+  };
+
+  const emitToolArguments = (toolState, argumentsChunk, options = {}) => {
+    const argumentText = typeof argumentsChunk === "string" ? argumentsChunk : "";
+    if (!argumentText && !options.forceHeader) {
+      return;
+    }
+
+    emitRole();
+    state.sawToolCalls = true;
+
+    const entry = {
+      index: toolState.index,
+    };
+
+    if (!toolState.headerSent || options.forceHeader) {
+      entry.id = toolState.id;
+      entry.type = "function";
+      entry.function = {
+        name: toolState.name || "tool",
+        ...(argumentText ? { arguments: argumentText } : {}),
+      };
+      toolState.headerSent = true;
+    } else {
+      entry.function = {};
+      if (argumentText) {
+        entry.function.arguments = argumentText;
+      }
+    }
+
+    if (argumentText) {
+      toolState.argumentDeltaSent = true;
+    }
+
+    emit({
+      ...baseChunk(),
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [entry],
+          },
+          finish_reason: null,
+        },
+      ],
+    });
+  };
+
+  const finalize = (event) => {
+    if (state.completed) {
+      return;
+    }
+    state.completed = true;
+
+    state.usage = responseUsageFromEvent(event) || state.usage;
+    emitRole();
+    emit({
+      ...baseChunk(),
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: determineChatFinishReason(state, event),
+        },
+      ],
+    });
+
+    if (state.includeUsage && state.usage) {
+      emit({
+        ...baseChunk(),
+        choices: [],
+        usage: {
+          prompt_tokens: Number(state.usage.input_tokens || 0),
+          completion_tokens: Number(state.usage.output_tokens || 0),
+          total_tokens: Number(state.usage.total_tokens || 0),
+          ...(state.usage.input_tokens_details
+            ? { prompt_tokens_details: state.usage.input_tokens_details }
+            : {}),
+          ...(state.usage.output_tokens_details
+            ? { completion_tokens_details: state.usage.output_tokens_details }
+            : {}),
+        },
+      });
+    }
+
+    ensureStarted();
+    res.end("data: [DONE]\n\n");
+  };
+
+  return {
+    onEvent(event) {
+      const identity = responseIdentityFromEvent(event, {
+        id: state.chunkId,
+        model: state.model,
+        created: state.created,
+      });
+      state.chunkId = identity.id || state.chunkId;
+      state.model = identity.model || state.model;
+      state.created = identity.created || state.created;
+
+      switch (event?.type) {
+        case "response.output_text.delta":
+        case "response.text.delta":
+          if (event.delta) {
+            emitRole();
+            state.emittedText = true;
+            emit({
+              ...baseChunk(),
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    content: event.delta,
+                  },
+                  finish_reason: null,
+                },
+              ],
+            });
+          }
+          return;
+        case "response.output_item.added":
+          if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+            ensureToolState(event.item.id || event.item.call_id, {
+              id: event.item.call_id || event.item.id,
+              name: event.item.name || event.item.function?.name,
+            });
+          }
+          return;
+        case "response.function_call_arguments.delta":
+        case "response.tool_call_arguments.delta": {
+          const toolState = ensureToolState(
+            event.item_id || event.tool_call_id || event.call_id || event.id,
+            {
+              id: event.call_id || event.tool_call_id || event.id,
+              name: event.name || event.function_name,
+            },
+          );
+          emitToolArguments(toolState, event.delta || event.arguments || "");
+          return;
+        }
+        case "response.function_call_arguments.done": {
+          const toolState = ensureToolState(event.item_id || event.call_id || event.id, {
+            id: event.call_id || event.id,
+            name: event.name,
+          });
+          if (!toolState.argumentDeltaSent) {
+            emitToolArguments(toolState, event.arguments || "{}", { forceHeader: true });
+          }
+          return;
+        }
+        case "response.output_item.done":
+          if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+            const toolState = ensureToolState(event.item.id || event.item.call_id, {
+              id: event.item.call_id || event.item.id,
+              name: event.item.name || event.item.function?.name,
+            });
+            if (!toolState.argumentDeltaSent) {
+              emitToolArguments(
+                toolState,
+                typeof event.item.arguments === "string"
+                  ? event.item.arguments
+                  : JSON.stringify(event.item.arguments || {}),
+                { forceHeader: true },
+              );
+            }
+            return;
+          }
+          if (!state.emittedText && event.item?.type === "message" && Array.isArray(event.item.content)) {
+            const text = event.item.content
+              .map((part) => (part?.type === "output_text" || part?.type === "text" ? part.text || "" : ""))
+              .filter(Boolean)
+              .join("");
+            if (text) {
+              emitRole();
+              state.emittedText = true;
+              emit({
+                ...baseChunk(),
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      content: text,
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+          }
+          return;
+        case "response.completed":
+        case "response.done":
+        case "response.incomplete":
+          finalize(event);
+          return;
+        default:
+          return;
+      }
+    },
+    onComplete() {
+      finalize({});
+    },
+  };
+}
+
+function createAnthropicStreamWriter(res, requestBody) {
+  const state = {
+    started: false,
+    completed: false,
+    sawToolUse: false,
+    messageId: `msg_${crypto.randomUUID()}`,
+    messageCreated: Math.floor(Date.now() / 1000),
+    outputTokens: 0,
+    activeTextIndex: null,
+    nextBlockIndex: 0,
+    toolBlocks: new Map(),
+    estimatedInputTokens: countRequestTokens(requestBody),
+  };
+
+  const ensureStarted = () => {
+    if (state.started) {
+      return;
+    }
+    state.started = true;
+    sseHeaders(res);
+    writeSse(res, "message_start", {
+      type: "message_start",
+      message: {
+        id: state.messageId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: requestBody.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: state.estimatedInputTokens,
+          output_tokens: 0,
+        },
+      },
+    });
+  };
+
+  const closeActiveTextBlock = () => {
+    if (state.activeTextIndex === null) {
+      return;
+    }
+    writeSse(res, "content_block_stop", {
+      type: "content_block_stop",
+      index: state.activeTextIndex,
+    });
+    state.activeTextIndex = null;
+  };
+
+  const ensureTextBlock = () => {
+    if (state.activeTextIndex !== null) {
+      return state.activeTextIndex;
+    }
+    ensureStarted();
+    const index = state.nextBlockIndex;
+    state.nextBlockIndex += 1;
+    state.activeTextIndex = index;
+    writeSse(res, "content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: {
+        type: "text",
+        text: "",
+      },
+    });
+    return index;
+  };
+
+  const ensureToolBlock = (itemId, meta = {}) => {
+    const key = itemId || meta.id || crypto.randomUUID();
+    if (!state.toolBlocks.has(key)) {
+      closeActiveTextBlock();
+      ensureStarted();
+      const index = state.nextBlockIndex;
+      state.nextBlockIndex += 1;
+      const block = {
+        key,
+        index,
+        id: meta.id || key,
+        name: meta.name || "tool",
+        stopped: false,
+        inputSent: false,
+      };
+      state.toolBlocks.set(key, block);
+      writeSse(res, "content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: {
+          type: "tool_use",
+          id: block.id,
+          name: block.name,
+          input: {},
+        },
+      });
+    }
+
+    const block = state.toolBlocks.get(key);
+    if (meta.id) {
+      block.id = meta.id;
+    }
+    if (meta.name) {
+      block.name = meta.name;
+    }
+    return block;
+  };
+
+  const emitToolJsonDelta = (block, partialJson) => {
+    ensureStarted();
+    state.sawToolUse = true;
+    block.inputSent = true;
+    writeSse(res, "content_block_delta", {
+      type: "content_block_delta",
+      index: block.index,
+      delta: {
+        type: "input_json_delta",
+        partial_json: partialJson,
+      },
+    });
+  };
+
+  const closeToolBlock = (block) => {
+    if (!block || block.stopped) {
+      return;
+    }
+    block.stopped = true;
+    writeSse(res, "content_block_stop", {
+      type: "content_block_stop",
+      index: block.index,
+    });
+  };
+
+  const finalize = (event) => {
+    if (state.completed) {
+      return;
+    }
+    state.completed = true;
+
+    closeActiveTextBlock();
+    for (const block of state.toolBlocks.values()) {
+      closeToolBlock(block);
+    }
+
+    const usage = responseUsageFromEvent(event);
+    if (usage) {
+      state.outputTokens = Number(usage.output_tokens || 0);
+    }
+
+    ensureStarted();
+    writeSse(res, "message_delta", {
+      type: "message_delta",
+      delta: {
+        stop_reason: determineAnthropicStopReason(state, event),
+        stop_sequence: null,
+      },
+      usage: {
+        output_tokens: state.outputTokens,
+      },
+    });
+    writeSse(res, "message_stop", {
+      type: "message_stop",
+    });
+    res.end();
+  };
+
+  return {
+    onEvent(event) {
+      const identity = responseIdentityFromEvent(event, {
+        id: state.messageId,
+        created: state.messageCreated,
+      });
+      state.messageId = identity.id || state.messageId;
+
+      switch (event?.type) {
+        case "response.output_text.delta":
+        case "response.text.delta":
+          if (event.delta) {
+            const index = ensureTextBlock();
+            writeSse(res, "content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: {
+                type: "text_delta",
+                text: event.delta,
+              },
+            });
+          }
+          return;
+        case "response.output_item.added":
+          if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+            ensureToolBlock(event.item.id || event.item.call_id, {
+              id: event.item.call_id || event.item.id,
+              name: event.item.name || event.item.function?.name,
+            });
+          }
+          return;
+        case "response.function_call_arguments.delta":
+        case "response.tool_call_arguments.delta": {
+          const block = ensureToolBlock(
+            event.item_id || event.tool_call_id || event.call_id || event.id,
+            {
+              id: event.call_id || event.tool_call_id || event.id,
+              name: event.name || event.function_name,
+            },
+          );
+          emitToolJsonDelta(block, event.delta || event.arguments || "");
+          return;
+        }
+        case "response.function_call_arguments.done": {
+          const block = ensureToolBlock(event.item_id || event.call_id || event.id, {
+            id: event.call_id || event.id,
+            name: event.name,
+          });
+          if (!block.inputSent) {
+            emitToolJsonDelta(block, event.arguments || "{}");
+          }
+          closeToolBlock(block);
+          return;
+        }
+        case "response.output_item.done":
+          if (event.item?.type === "function_call" || event.item?.type === "tool_call") {
+            const block = ensureToolBlock(event.item.id || event.item.call_id, {
+              id: event.item.call_id || event.item.id,
+              name: event.item.name || event.item.function?.name,
+            });
+            if (!block.inputSent) {
+              emitToolJsonDelta(
+                block,
+                typeof event.item.arguments === "string"
+                  ? event.item.arguments
+                  : JSON.stringify(event.item.arguments || {}),
+              );
+            }
+            closeToolBlock(block);
+            return;
+          }
+          if (event.item?.type === "message" && Array.isArray(event.item.content)) {
+            const text = event.item.content
+              .map((part) => (part?.type === "output_text" || part?.type === "text" ? part.text || "" : ""))
+              .filter(Boolean)
+              .join("");
+            if (text && state.activeTextIndex === null && !state.completed) {
+              const index = ensureTextBlock();
+              writeSse(res, "content_block_delta", {
+                type: "content_block_delta",
+                index,
+                delta: {
+                  type: "text_delta",
+                  text,
+                },
+              });
+            }
+          }
+          return;
+        case "response.completed":
+        case "response.done":
+        case "response.incomplete":
+          finalize(event);
+          return;
+        default:
+          return;
+      }
+    },
+    onComplete() {
+      finalize({});
+    },
+  };
+}
+
+async function proxyResponsesStream(config, runtime, requestBody, res) {
+  const candidates = resolveCandidateProviders(config, runtime);
+  const errors = [];
+
+  for (const provider of candidates) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+    const startedAt = Date.now();
+
+    try {
+      const response = await fetch(`${provider.baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${provider.apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const rawText = await response.text();
+        const data = parseJsonText(rawText);
+        const error = new Error(
+          data?.error?.message || data?.message || `Upstream returned HTTP ${response.status}.`,
+        );
+        error.statusCode = response.status;
+        error.payload = data;
+        throw error;
+      }
+
+      const contentType = response.headers.get("content-type") || "text/event-stream; charset=utf-8";
+      res.writeHead(200, {
+        "content-type": contentType,
+        "cache-control": response.headers.get("cache-control") || "no-cache, no-transform",
+        connection: "keep-alive",
+      });
+      await pipeWebStreamToResponse(response.body, res);
+      res.end();
+      recordProviderSuccess(runtime, provider, Date.now() - startedAt, response.status);
+      return provider;
+    } catch (error) {
+      recordProviderFailure(runtime, provider, Date.now() - startedAt, error);
+      errors.push(buildProviderError(provider, error));
+      if (!isRetryableStatus(error.statusCode || 0)) {
+        throw error;
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw aggregateProviderError(
+    errors,
+    "No upstream provider completed the streaming request.",
+  );
 }
 
 function streamAnthropicMessage(res, anthropicMessage) {
@@ -766,27 +1669,13 @@ function countRequestTokens(body) {
   return estimateTokens(`${systemText}\n${messagesText}\n${toolText}`);
 }
 
-function buildModelList(config) {
-  return [
-    {
-      id: "claude-opus-4-1-20250805",
-      type: "model",
-      display_name: `Claude Opus -> ${config.modelMap.opus}`,
-      created_at: "2025-08-05T00:00:00Z",
-    },
-    {
-      id: "claude-sonnet-4-5-20250929",
-      type: "model",
-      display_name: `Claude Sonnet -> ${config.modelMap.sonnet}`,
-      created_at: "2025-09-29T00:00:00Z",
-    },
-    {
-      id: "claude-3-5-haiku-20241022",
-      type: "model",
-      display_name: `Claude Haiku -> ${config.modelMap.haiku}`,
-      created_at: "2024-10-22T00:00:00Z",
-    },
-  ];
+async function fetchModelList(config, runtime) {
+  const { data } = await requestAcrossProviders(config, runtime, {
+    pathname: "/v1/models",
+    method: "GET",
+  });
+  const upstreamModels = Array.isArray(data?.data) ? data.data : [];
+  return buildUnifiedModelList(config, upstreamModels);
 }
 
 export function createBridgeServer(config) {
@@ -794,8 +1683,13 @@ export function createBridgeServer(config) {
 
   return http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+    const modelListPaths = ["/v1/models", "/models"];
+    const modelDetailPaths = ["/v1/models/", "/models/"];
+    const responsesPaths = ["/v1/responses", "/responses"];
+    const chatCompletionsPaths = ["/v1/chat/completions", "/chat/completions"];
 
     if (req.method === "GET" && url.pathname === "/health") {
+      const recommendedModel = pickRecommendedModel(config);
       return json(res, 200, {
         ok: true,
         port: config.port,
@@ -805,6 +1699,9 @@ export function createBridgeServer(config) {
         providerName: config.provider?.name || null,
         routing: config.routing,
         modelMap: config.modelMap,
+        openaiBaseUrl: `http://${config.listenHost}:${config.port}/v1`,
+        bridgeApiKey: "bridge-local",
+        recommendedModel,
       });
     }
 
@@ -812,25 +1709,51 @@ export function createBridgeServer(config) {
       return json(res, 200, buildRuntimeStatus(config, runtime));
     }
 
-    if (req.method === "GET" && url.pathname === "/v1/models") {
-      return json(res, 200, {
-        object: "list",
-        data: buildModelList(config),
-        has_more: false,
-        first_id: null,
-        last_id: null,
-      });
+    if (req.method === "GET" && pathMatches(url.pathname, modelListPaths)) {
+      try {
+        const data = await fetchModelList(config, runtime);
+        return json(res, 200, {
+          object: "list",
+          data,
+          has_more: false,
+          first_id: data[0]?.id || null,
+          last_id: data[data.length - 1]?.id || null,
+        });
+      } catch (error) {
+        const statusCode = error.statusCode || 502;
+        const message =
+          error.payload?.error?.message ||
+          error.payload?.errors?.map((item) => `${item.providerId}:${item.message}`).join(" | ") ||
+          error.message ||
+          "Bridge failed to fetch the upstream model list.";
+        return openAiError(res, statusCode, "api_error", message);
+      }
     }
 
-    if (req.method === "GET" && url.pathname.startsWith("/v1/models/")) {
-      const modelId = decodeURIComponent(url.pathname.slice("/v1/models/".length));
-      const model = buildModelList(config).find((item) => item.id === modelId);
+    if (
+      req.method === "GET" &&
+      modelDetailPaths.some((prefix) => url.pathname.startsWith(prefix))
+    ) {
+      try {
+        const data = await fetchModelList(config, runtime);
+        const matchedPrefix = modelDetailPaths.find((prefix) => url.pathname.startsWith(prefix));
+        const modelId = decodeURIComponent(url.pathname.slice(matchedPrefix.length));
+        const model = data.find((item) => item.id === modelId);
 
-      if (!model) {
-        return anthropicError(res, 404, "not_found_error", `Unknown model: ${modelId}`);
+        if (!model) {
+          return openAiError(res, 404, "not_found_error", `Unknown model: ${modelId}`);
+        }
+
+        return json(res, 200, model);
+      } catch (error) {
+        const statusCode = error.statusCode || 502;
+        const message =
+          error.payload?.error?.message ||
+          error.payload?.errors?.map((item) => `${item.providerId}:${item.message}`).join(" | ") ||
+          error.message ||
+          "Bridge failed to fetch the upstream model detail.";
+        return openAiError(res, statusCode, "api_error", message);
       }
-
-      return json(res, 200, model);
     }
 
     if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
@@ -845,42 +1768,41 @@ export function createBridgeServer(config) {
     }
 
     if (req.method === "POST" && url.pathname === "/v1/messages") {
+      let body;
       try {
-        const body = await readJsonBody(req);
+        body = await readJsonBody(req);
         const upstreamRequest = convertAnthropicToResponses(config, body);
         runtime.requestCount += 1;
         runtime.lastRequestAt = new Date().toISOString();
-        const candidates = resolveCandidateProviders(config, runtime);
-        let upstreamResponse = null;
-        let usedProvider = null;
-        const errors = [];
 
-        for (const provider of candidates) {
-          try {
-            upstreamResponse = await callResponsesApi(config, runtime, provider, upstreamRequest);
-            usedProvider = provider;
-            break;
-          } catch (error) {
-            errors.push({
-              providerId: provider.id,
-              statusCode: error.statusCode || null,
-              message: error.payload?.error?.message || error.message || "unknown error",
-            });
-
-            if (!isRetryableStatus(error.statusCode || 0)) {
-              throw error;
-            }
-          }
-        }
-
-        if (!upstreamResponse || !usedProvider) {
-          const error = new Error(
-            errors[errors.length - 1]?.message || "No upstream provider completed the request.",
+        if (body.stream) {
+          const writer = createAnthropicStreamWriter(res, body);
+          const usedProvider = await streamResponsesEvents(
+            config,
+            runtime,
+            {
+              ...upstreamRequest,
+              stream: true,
+            },
+            writer,
           );
-          error.statusCode = errors[errors.length - 1]?.statusCode || 502;
-          error.payload = { errors };
-          throw error;
+          if (!config.quiet) {
+            console.log(
+              `[bridge] ${new Date().toISOString()} ${usedProvider.id} ${body.model || "unknown"} -> ${upstreamRequest.model} (stream)`,
+            );
+          }
+          return;
         }
+
+        const { data: upstreamResponse, provider: usedProvider } = await requestAcrossProviders(
+          config,
+          runtime,
+          {
+            pathname: "/v1/responses",
+            method: "POST",
+            body: upstreamRequest,
+          },
+        );
 
         const anthropicMessage = buildAnthropicMessage(body, upstreamResponse);
 
@@ -888,11 +1810,6 @@ export function createBridgeServer(config) {
           console.log(
             `[bridge] ${new Date().toISOString()} ${usedProvider.id} ${body.model || "unknown"} -> ${upstreamRequest.model}`,
           );
-        }
-
-        if (body.stream) {
-          streamAnthropicMessage(res, anthropicMessage);
-          return;
         }
 
         return json(res, 200, anthropicMessage);
@@ -906,7 +1823,134 @@ export function createBridgeServer(config) {
         if (!config.quiet) {
           console.error(`[bridge] request failed: ${message}`);
         }
+        if (body?.stream && res.headersSent) {
+          res.end();
+          return;
+        }
         return anthropicError(res, statusCode, "api_error", message);
+      }
+    }
+
+    if (req.method === "POST" && pathMatches(url.pathname, responsesPaths)) {
+      let body;
+      try {
+        body = await readJsonBody(req);
+        const upstreamRequest = {
+          ...body,
+          model: mapOpenAiModel(config, body.model),
+        };
+        runtime.requestCount += 1;
+        runtime.lastRequestAt = new Date().toISOString();
+
+        if (upstreamRequest.stream) {
+          const usedProvider = await proxyResponsesStream(config, runtime, upstreamRequest, res);
+          if (!config.quiet) {
+            console.log(
+              `[bridge] ${new Date().toISOString()} ${usedProvider.id} responses ${body.model || "default"} -> ${upstreamRequest.model} (stream)`,
+            );
+          }
+          return;
+        }
+
+        const { data: upstreamResponse, provider: usedProvider } = await requestAcrossProviders(
+          config,
+          runtime,
+          {
+            pathname: "/v1/responses",
+            method: "POST",
+            body: upstreamRequest,
+          },
+        );
+
+        if (!config.quiet) {
+          console.log(
+            `[bridge] ${new Date().toISOString()} ${usedProvider.id} responses ${body.model || "default"} -> ${upstreamRequest.model}`,
+          );
+        }
+
+        return json(res, 200, upstreamResponse);
+      } catch (error) {
+        const statusCode = error.statusCode || 502;
+        const message =
+          error.payload?.error?.message ||
+          error.payload?.errors?.map((item) => `${item.providerId}:${item.message}`).join(" | ") ||
+          error.message ||
+          "Bridge failed to proxy the upstream Responses API.";
+        if (!config.quiet) {
+          console.error(`[bridge] responses request failed: ${message}`);
+        }
+        if (body?.stream && res.headersSent) {
+          res.end();
+          return;
+        }
+        return openAiError(res, statusCode, "api_error", message);
+      }
+    }
+
+    if (req.method === "POST" && pathMatches(url.pathname, chatCompletionsPaths)) {
+      let body;
+      try {
+        body = await readJsonBody(req);
+        const upstreamRequest = convertOpenAiChatToResponses(config, body);
+        runtime.requestCount += 1;
+        runtime.lastRequestAt = new Date().toISOString();
+
+        if (body.stream) {
+          const writer = createOpenAiChatStreamWriter(
+            res,
+            body,
+            upstreamRequest.model,
+          );
+          const usedProvider = await streamResponsesEvents(
+            config,
+            runtime,
+            {
+              ...upstreamRequest,
+              stream: true,
+            },
+            writer,
+          );
+          if (!config.quiet) {
+            console.log(
+              `[bridge] ${new Date().toISOString()} ${usedProvider.id} chat ${body.model || "default"} -> ${upstreamRequest.model} (stream)`,
+            );
+          }
+          return;
+        }
+
+        const { data: upstreamResponse, provider: usedProvider } = await requestAcrossProviders(
+          config,
+          runtime,
+          {
+            pathname: "/v1/responses",
+            method: "POST",
+            body: upstreamRequest,
+          },
+        );
+        const chatCompletion = buildOpenAiChatCompletion(body, upstreamResponse);
+
+        if (!config.quiet) {
+          console.log(
+            `[bridge] ${new Date().toISOString()} ${usedProvider.id} chat ${body.model || "default"} -> ${upstreamRequest.model}${body.stream ? " (stream)" : ""}`,
+          );
+        }
+
+        return json(res, 200, chatCompletion);
+      } catch (error) {
+        const statusCode = error.statusCode || 502;
+        const message =
+          error.payload?.error?.message ||
+          error.payload?.errors?.map((item) => `${item.providerId}:${item.message}`).join(" | ") ||
+          error.message ||
+          "Bridge failed to convert OpenAI chat completions to the upstream Responses API.";
+        if (!config.quiet) {
+          console.error(`[bridge] chat completion request failed: ${message}`);
+        }
+        if (body?.stream && res.headersSent) {
+          res.end();
+          return;
+        }
+        return openAiError(res, statusCode, "api_error", message);
       }
     }
 
