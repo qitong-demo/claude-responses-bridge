@@ -16,6 +16,22 @@ const CONTINUE_EXTENSION_ID = "Continue.continue";
 const MANAGED_MARKER = "# Managed by Claude Responses Bridge";
 
 function runCommand(command, args, options = {}) {
+  const isCmdScript = /\.(cmd|bat)$/i.test(command);
+  if (isCmdScript && process.platform === "win32") {
+    const commandLine = `& '${command.replace(/'/g, "''")}' ${args
+      .map((item) => {
+        const text = String(item);
+        return /[\s'"]/u.test(text) ? `'${text.replace(/'/g, "''")}'` : text;
+      })
+      .join(" ")}`.trim();
+    return spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", commandLine], {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
+    });
+  }
+
   return spawnSync(command, args, {
     encoding: "utf8",
     shell: false,
@@ -34,8 +50,9 @@ function resolveCursorCommand() {
 
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
+      const cmdSibling = `${candidate}.cmd`;
       return {
-        command: candidate,
+        command: existsSync(cmdSibling) ? cmdSibling : candidate,
         shellName: "cursor",
       };
     }
@@ -172,8 +189,12 @@ models:
 
 function installContinueExtension(cursorCommandPath) {
   const result = runCommand(cursorCommandPath, ["--install-extension", CONTINUE_EXTENSION_ID]);
+  const installedAfterAttempt = listInstalledExtensions(cursorCommandPath).includes(
+    CONTINUE_EXTENSION_ID.toLowerCase(),
+  );
   return {
-    ok: result.status === 0,
+    ok: result.status === 0 || installedAfterAttempt,
+    recovered: result.status !== 0 && installedAfterAttempt,
     stdout: String(result.stdout || "").trim(),
     stderr: String(result.stderr || "").trim(),
   };
@@ -220,13 +241,14 @@ async function askYesNo(rl, label, defaultValue = true) {
 
 function buildCursorStatus(config, cursorInfo, continueStatus, upstreamModels) {
   const recommendedModel = pickRecommendedModel(config, upstreamModels);
+  const installedExtensions = (cursorInfo?.extensions || []).map((item) => item.toLowerCase());
   return {
     note: "This sets up an official third-party extension inside Cursor. It does not unlock Cursor native free-plan named models.",
     cursor: {
       detected: Boolean(cursorInfo),
       commandPath: cursorInfo?.command || null,
       executablePath: cursorInfo?.executablePath || null,
-      continueInstalled: Boolean(cursorInfo?.extensions?.includes(CONTINUE_EXTENSION_ID)),
+      continueInstalled: installedExtensions.includes(CONTINUE_EXTENSION_ID.toLowerCase()),
     },
     continue: {
       configPath: continueStatus.path,
@@ -330,9 +352,16 @@ export async function runCursor(restArgs) {
       }
       return 1;
     }
-    console.log(`\n[bridge] Installed ${CONTINUE_EXTENSION_ID}.`);
+    if (result.recovered) {
+      console.log(`\n[bridge] ${CONTINUE_EXTENSION_ID} is already present after the install attempt.`);
+    } else {
+      console.log(`\n[bridge] Installed ${CONTINUE_EXTENSION_ID}.`);
+    }
     if (result.stdout) {
       console.log(result.stdout);
+    }
+    if (result.stderr && result.recovered) {
+      console.log(result.stderr);
     }
   }
 

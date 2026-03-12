@@ -11,6 +11,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Removed accidental self-dependency metadata after release packaging
 - Ignore `node_modules/` and `package-lock.json` in this repo to keep local release artifacts out of git
 
+## [0.3.2] - 2026-03-12
+
+### Fixed
+
+- Cursor extension detection on Windows now invokes `cursor.cmd` through PowerShell, so installed extensions like Continue are detected reliably
+- Cursor integration no longer flips between installed and not-installed states depending on how the CLI resolves the Cursor command
+
 ## [0.3.0] - 2026-03-12
 
 ### Added
