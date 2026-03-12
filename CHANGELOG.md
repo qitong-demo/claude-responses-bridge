@@ -25,6 +25,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Bridge now serializes upstream requests per provider to reduce `Concurrency limit exceeded for account` errors from low-concurrency upstream gateways
 - Provider status output now exposes queue and in-flight counts for easier troubleshooting
 
+## [0.3.4] - 2026-03-12
+
+### Fixed
+
+- Cursor integration now writes both `~/.continue/config.yaml` and a bridge-managed `~/.continue/config.ts`, so Continue can show configured models more reliably across config loading modes
+- Cursor status output now reports both YAML and TypeScript Continue config states
+
 ## [0.3.0] - 2026-03-12
 
 ### Added

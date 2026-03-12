@@ -14,6 +14,8 @@ import { pickRecommendedModel } from "../openai-compat.mjs";
 
 const CONTINUE_EXTENSION_ID = "Continue.continue";
 const MANAGED_MARKER = "# Managed by Claude Responses Bridge";
+const MANAGED_TS_MARKER = "// Managed by Claude Responses Bridge";
+const DEFAULT_CONTINUE_TS = `export function modifyConfig(config: Config): Config {\n  return config;\n}\n`;
 
 function runCommand(command, args, options = {}) {
   const isCmdScript = /\.(cmd|bat)$/i.test(command);
@@ -118,6 +120,23 @@ function readContinueConfigStatus(configPath) {
   };
 }
 
+function readManagedFileStatus(configPath, marker) {
+  if (!existsSync(configPath)) {
+    return {
+      exists: false,
+      managedByBridge: false,
+      content: "",
+    };
+  }
+
+  const content = readFileSync(configPath, "utf8");
+  return {
+    exists: true,
+    managedByBridge: content.includes(marker),
+    content,
+  };
+}
+
 function fetchUpstreamModels(config) {
   const response = spawnSync(
     process.execPath,
@@ -187,6 +206,30 @@ models:
 `;
 }
 
+function buildContinueConfigTs(config, recommendedModel) {
+  const bridgeBaseUrl = `http://${config.listenHost}:${config.port}/v1`;
+
+  return `${MANAGED_TS_MARKER}
+export function modifyConfig(config: Config): Config {
+  return {
+    ...config,
+    models: [
+      {
+        title: "Bridge Agent",
+        provider: "openai",
+        model: "${recommendedModel}",
+        apiBase: "${bridgeBaseUrl}",
+        apiKey: "bridge-local",
+        completionOptions: {
+          stream: true
+        }
+      }
+    ]
+  };
+}
+`;
+}
+
 function installContinueExtension(cursorCommandPath) {
   const result = runCommand(cursorCommandPath, ["--install-extension", CONTINUE_EXTENSION_ID]);
   const installedAfterAttempt = listInstalledExtensions(cursorCommandPath).includes(
@@ -217,6 +260,10 @@ function writeContinueConfig(configPath, content) {
   writeFileSync(configPath, content, "utf8");
 }
 
+function isDefaultContinueTs(content) {
+  return String(content || "").trim() === DEFAULT_CONTINUE_TS.trim();
+}
+
 function makeBackupPath(targetPath) {
   const now = new Date();
   const stamp = [
@@ -239,7 +286,7 @@ async function askYesNo(rl, label, defaultValue = true) {
   return answer === "y" || answer === "yes";
 }
 
-function buildCursorStatus(config, cursorInfo, continueStatus, upstreamModels) {
+function buildCursorStatus(config, cursorInfo, continueStatus, continueTsStatus, upstreamModels) {
   const recommendedModel = pickRecommendedModel(config, upstreamModels);
   const installedExtensions = (cursorInfo?.extensions || []).map((item) => item.toLowerCase());
   return {
@@ -254,6 +301,9 @@ function buildCursorStatus(config, cursorInfo, continueStatus, upstreamModels) {
       configPath: continueStatus.path,
       configExists: continueStatus.exists,
       managedByBridge: continueStatus.managedByBridge,
+      configTsPath: continueTsStatus.path,
+      configTsExists: continueTsStatus.exists,
+      configTsManagedByBridge: continueTsStatus.managedByBridge,
     },
     bridge: {
       localBaseUrl: `http://${config.listenHost}:${config.port}/v1`,
@@ -273,6 +323,9 @@ function printStatus(status) {
   console.log(`  Continue config: ${status.continue.configPath}`);
   console.log(`  Continue config exists: ${status.continue.configExists ? "yes" : "no"}`);
   console.log(`  Managed by bridge: ${status.continue.managedByBridge ? "yes" : "no"}`);
+  console.log(`  Continue config.ts: ${status.continue.configTsPath}`);
+  console.log(`  Continue config.ts exists: ${status.continue.configTsExists ? "yes" : "no"}`);
+  console.log(`  config.ts managed by bridge: ${status.continue.configTsManagedByBridge ? "yes" : "no"}`);
   console.log(`  Bridge base URL: ${status.bridge.localBaseUrl}`);
   console.log(`  Bridge API key: ${status.bridge.localApiKey}`);
   console.log(`  Recommended model: ${status.bridge.recommendedModel}`);
@@ -287,9 +340,14 @@ export async function runCursor(restArgs) {
   });
   const cursorCommand = resolveCursorCommand();
   const continueConfigPath = path.join(os.homedir(), ".continue", "config.yaml");
+  const continueConfigTsPath = path.join(os.homedir(), ".continue", "config.ts");
   const continueStatus = {
     path: continueConfigPath,
     ...readContinueConfigStatus(continueConfigPath),
+  };
+  const continueTsStatus = {
+    path: continueConfigTsPath,
+    ...readManagedFileStatus(continueConfigTsPath, MANAGED_TS_MARKER),
   };
   const upstreamModels = fetchUpstreamModels(config);
   const cursorInfo = cursorCommand
@@ -299,7 +357,13 @@ export async function runCursor(restArgs) {
         extensions: listInstalledExtensions(cursorCommand.command),
       }
     : null;
-  const status = buildCursorStatus(config, cursorInfo, continueStatus, upstreamModels);
+  const status = buildCursorStatus(
+    config,
+    cursorInfo,
+    continueStatus,
+    continueTsStatus,
+    upstreamModels,
+  );
 
   if (args.json) {
     console.log(JSON.stringify(status, null, 2));
@@ -366,8 +430,13 @@ export async function runCursor(restArgs) {
   }
 
   const latestContinueStatus = readContinueConfigStatus(continueConfigPath);
+  const latestContinueTsStatus = readManagedFileStatus(
+    continueConfigTsPath,
+    MANAGED_TS_MARKER,
+  );
   const recommendedModel = status.bridge.recommendedModel;
   const configContent = buildContinueConfigYaml(config, recommendedModel);
+  const configTsContent = buildContinueConfigTs(config, recommendedModel);
 
   let shouldWriteConfig = Boolean(args["write-config"] || args.writeConfig);
   let forceWrite = Boolean(args.force);
@@ -394,6 +463,18 @@ export async function runCursor(restArgs) {
           false,
         );
       }
+      if (
+        shouldWriteConfig &&
+        latestContinueTsStatus.exists &&
+        !latestContinueTsStatus.managedByBridge &&
+        !isDefaultContinueTs(latestContinueTsStatus.content)
+      ) {
+        forceWrite = await askYesNo(
+          rl,
+          "Existing Continue config.ts is not bridge-managed. Backup and overwrite it?",
+          forceWrite,
+        );
+      }
     } finally {
       rl.close();
     }
@@ -413,6 +494,30 @@ export async function runCursor(restArgs) {
 
       writeContinueConfig(continueConfigPath, configContent);
       console.log(`\n[bridge] Wrote Continue config to ${continueConfigPath}.`);
+    }
+
+    if (
+      latestContinueTsStatus.exists &&
+      !latestContinueTsStatus.managedByBridge &&
+      !isDefaultContinueTs(latestContinueTsStatus.content) &&
+      !forceWrite
+    ) {
+      console.log(
+        `[bridge] Skipped writing ${continueConfigTsPath} because it already exists and is not bridge-managed.`,
+      );
+    } else {
+      if (
+        latestContinueTsStatus.exists &&
+        !latestContinueTsStatus.managedByBridge &&
+        !isDefaultContinueTs(latestContinueTsStatus.content)
+      ) {
+        const backupPath = makeBackupPath(continueConfigTsPath);
+        writeFileSync(backupPath, latestContinueTsStatus.content, "utf8");
+        console.log(`[bridge] Backed up existing Continue config.ts to ${backupPath}.`);
+      }
+
+      writeContinueConfig(continueConfigTsPath, configTsContent);
+      console.log(`[bridge] Wrote Continue config.ts to ${continueConfigTsPath}.`);
     }
   }
 
