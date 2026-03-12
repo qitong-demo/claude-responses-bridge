@@ -304,9 +304,17 @@ export async function runCursor(restArgs) {
               });
               try {
                 if (!status.cursor.continueInstalled) {
-                  return askYesNo(rl, "\nInstall the Continue extension into Cursor now?", true);
+                  return await askYesNo(
+                    rl,
+                    "\nInstall the Continue extension into Cursor now?",
+                    true,
+                  );
                 }
-                return askYesNo(rl, "\nReinstall/update the Continue extension now?", false);
+                return await askYesNo(
+                  rl,
+                  "\nReinstall/update the Continue extension now?",
+                  false,
+                );
               } finally {
                 rl.close();
               }

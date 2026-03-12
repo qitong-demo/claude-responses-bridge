@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.3.1] - 2026-03-12
+
+### Fixed
+
+- `cursor` interactive install prompt now correctly waits for user input instead of exiting with an unsettled top-level await warning
+- Removed accidental self-dependency metadata after release packaging
+- Ignore `node_modules/` and `package-lock.json` in this repo to keep local release artifacts out of git
+
 ## [0.3.0] - 2026-03-12
 
 ### Added

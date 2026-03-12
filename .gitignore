@@ -1,5 +1,7 @@
 config.local.json
 .npmrc
+node_modules/
+package-lock.json
 *.tgz
 bridge.stdout.log
 bridge.stderr.log
